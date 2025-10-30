@@ -9,9 +9,8 @@ The outbox pattern ensures reliable message delivery by persisting events in the
 This implementation provides:
 - **Reliable delivery** with at-least-once semantics
 - **Concurrent processing** with configurable concurrency limits
-- **Automatic retries** for transient failures
 - **Entity-based grouping** for ordered processing per entity
-- **Delete-after-send** strategy for optimal performance
+- **Automatic retries** on errors
 - **Comprehensive test coverage** (unit + integration)
 
 ## Installation
@@ -129,8 +128,8 @@ All interfaces (`Source`, `Destination`) must use the same type `T`. This ensure
 
 1. **Fetch**: Retrieves a batch of unsent items from the source (database)
 2. **Group**: Groups items by `EntityId` to ensure ordered processing per entity
-3. **Send**: Sends each item to the destination (message queue) with retries
-4. **Mark**: Deletes the item from the source after successful delivery
+3. **Send**: Sends each item to the destination (message queue)
+4. **Acknowledge**: Marks the item as sent in the source after successful delivery
 5. **Repeat**: Continues until context is cancelled
 
 ### Entity-Based Processing
@@ -178,19 +177,13 @@ See [TESTING.md](TESTING.md) for detailed testing documentation.
 
 ## Architecture
 
-### Delete vs Soft Delete
+The `Outbox` is interface-based and doesn't dictate how you implement `Source` or `Destination`. Use any database, message broker, or acknowledgment strategy.
 
-This implementation uses the **delete approach** - events are deleted immediately after successful delivery.
+The integration tests demonstrate one common approach (delete after send), but you can implement it however you need.
 
-**Why delete?**
-- Small table size = optimal query performance
-- No cleanup jobs needed
-- Minimal indexing required
-- Simple implementation
+See [ARCHITECTURE.md](ARCHITECTURE.md) for implementation examples and design considerations.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed design decisions and alternative approaches.
-
-### Database Schema Example
+### Database Schema Example (from integration tests)
 
 ```sql
 CREATE TABLE outbox_events (
@@ -203,12 +196,14 @@ CREATE TABLE outbox_events (
 CREATE INDEX idx_outbox_events_created_at ON outbox_events(created_at);
 ```
 
+This is just one possible schema. Your implementation can use any structure that fits your needs.
+
 ## Production Considerations
 
 ### Error Handling
-- Failed sends are retried with exponential backoff
-- If all retries fail, processing stops for that entity group
-- Other entity groups continue processing
+- Failed sends stop processing for that entity group
+- Other entity groups continue processing independently
+- Failed items will be retried on the next fetch cycle
 
 ### Concurrency
 - Limit `MaxConcurrentGroups` based on your database connection pool
@@ -227,8 +222,7 @@ CREATE INDEX idx_outbox_events_created_at ON outbox_events(created_at);
 
 ## Dependencies
 
-- [cenkalti/backoff/v5](https://github.com/cenkalti/backoff) - Exponential backoff for retries
-- [google/uuid](https://github.com/google/uuid) - Run ID generation
+- [google/uuid](https://github.com/google/uuid) - Run ID generation for logging
 
 ## Contributing
 
@@ -237,10 +231,6 @@ Contributions are welcome! Please:
 2. Follow Go best practices and coding standards
 3. Add tests for new functionality
 4. Update documentation as needed
-
-## License
-
-[Add your license here]
 
 ## References
 
