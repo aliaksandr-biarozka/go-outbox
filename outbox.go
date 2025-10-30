@@ -208,7 +208,7 @@ func New[T Item](source Source[T], destination Destination[T], config Config, lo
 func (o *Outbox[T]) Run(ctx context.Context) error {
 	o.logger.InfoContext(ctx, "starting outbox with config", slog.Group("config",
 		slog.Int("batch_size", o.config.BatchSize),
-		slog.Int("max_sleep_sec", o.config.SleepSec),
+		slog.Int("sleep_sec", o.config.SleepSec),
 		slog.Int("max_concurrent_groups", o.config.MaxConcurrentGroups),
 	))
 
