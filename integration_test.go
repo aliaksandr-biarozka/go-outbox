@@ -29,7 +29,7 @@ func newPostgresSource(db *sql.DB, logger *slog.Logger) *postgresSource {
 	}
 }
 
-func (p *postgresSource) GetItems(ctx context.Context, batchSize int) ([]Item, error) {
+func (p *postgresSource) GetItems(ctx context.Context, batchSize int) ([]*outboxEvent, error) {
 	query := `
 		SELECT id, entity_id, message, created_at 
 		FROM outbox_events 
@@ -43,7 +43,7 @@ func (p *postgresSource) GetItems(ctx context.Context, batchSize int) ([]Item, e
 	}
 	defer rows.Close()
 
-	var items []Item
+	var items []*outboxEvent
 	for rows.Next() {
 		var event outboxEvent
 		err := rows.Scan(&event.id, &event.entityId, &event.message, &event.createdAt)
@@ -56,7 +56,7 @@ func (p *postgresSource) GetItems(ctx context.Context, batchSize int) ([]Item, e
 	return items, nil
 }
 
-func (p *postgresSource) MarkAsSent(ctx context.Context, item Item) error {
+func (p *postgresSource) Acknowledge(ctx context.Context, item *outboxEvent) error {
 	query := `DELETE FROM outbox_events WHERE id = $1`
 	_, err := p.db.ExecContext(ctx, query, item.GetId())
 	if err != nil {
@@ -97,13 +97,8 @@ func newRabbitmqDestination(conn *amqp.Connection, logger *slog.Logger) (*rabbit
 	}, nil
 }
 
-func (r *rabbitmqDestination) Send(ctx context.Context, item Item) error {
-	event, ok := item.(*outboxEvent)
-	if !ok {
-		return fmt.Errorf("invalid item type")
-	}
-
-	routingKey := fmt.Sprintf("entity.%s", event.GetEntityId())
+func (r *rabbitmqDestination) Send(ctx context.Context, item *outboxEvent) error {
+	routingKey := fmt.Sprintf("entity.%s", item.GetEntityId())
 
 	err := r.ch.Publish(
 		"outbox",   // exchange
@@ -112,9 +107,9 @@ func (r *rabbitmqDestination) Send(ctx context.Context, item Item) error {
 		false,      // immediate
 		amqp.Publishing{
 			ContentType: "application/json",
-			Body:        []byte(event.message),
-			MessageId:   event.id,
-			Timestamp:   event.createdAt,
+			Body:        []byte(item.message),
+			MessageId:   item.id,
+			Timestamp:   item.createdAt,
 		},
 	)
 	if err != nil {
@@ -124,7 +119,7 @@ func (r *rabbitmqDestination) Send(ctx context.Context, item Item) error {
 	return nil
 }
 
-func (r *rabbitmqDestination) SendMany(ctx context.Context, items []Item) error {
+func (r *rabbitmqDestination) SendMany(ctx context.Context, items []*outboxEvent) error {
 	for _, item := range items {
 		if err := r.Send(ctx, item); err != nil {
 			return err
@@ -152,6 +147,7 @@ type outboxEvent struct {
 
 func (e *outboxEvent) GetEntityId() string { return e.entityId }
 func (e *outboxEvent) GetId() string       { return e.id }
+func (e *outboxEvent) GetSequence() int64  { return e.createdAt.UnixMilli() }
 
 func setupPostgres(t *testing.T) (*sql.DB, func()) {
 	ctx := context.Background()
@@ -294,10 +290,9 @@ func TestIntegration_OutboxWithPostgresAndRabbitMQ(t *testing.T) {
 	}
 	defer destination.Close()
 
-	outbox := New(source, destination, Config{
+	outbox := New[*outboxEvent](source, destination, Config{
 		BatchSize:           5,
-		MaxTries:            3,
-		MaxSleepSec:         1,
+		SleepSec:            1,
 		MaxConcurrentGroups: 2,
 	}, logger)
 
@@ -335,7 +330,7 @@ func TestIntegration_OutboxWithPostgresAndRabbitMQ(t *testing.T) {
 	}
 
 	if remainingCount != 0 {
-		t.Errorf("expected 0 remaining events (all deleted), got %d", remainingCount)
+		t.Errorf("expected 0 remaining events (allgo env GOMODCACHE deleted), got %d", remainingCount)
 	}
 }
 
@@ -361,10 +356,9 @@ func TestIntegration_OutboxWithPostgresAndRabbitMQ_ErrorHandling(t *testing.T) {
 	}
 	defer destination.Close()
 
-	outbox := New(source, destination, Config{
+	outbox := New[*outboxEvent](source, destination, Config{
 		BatchSize:           5,
-		MaxTries:            1, // Only 1 retry
-		MaxSleepSec:         1,
+		SleepSec:            1,
 		MaxConcurrentGroups: 2,
 	}, logger)
 
@@ -427,10 +421,9 @@ func TestIntegration_OutboxWithPostgresAndRabbitMQ_ConcurrentProcessing(t *testi
 	}
 	defer destination.Close()
 
-	outbox := New(source, destination, Config{
+	outbox := New[*outboxEvent](source, destination, Config{
 		BatchSize:           3,
-		MaxTries:            3,
-		MaxSleepSec:         1,
+		SleepSec:            1,
 		MaxConcurrentGroups: 1, // Only 1 concurrent group
 	}, logger)
 
@@ -476,5 +469,163 @@ func TestIntegration_OutboxWithPostgresAndRabbitMQ_ConcurrentProcessing(t *testi
 
 	if remainingCount != 0 {
 		t.Errorf("expected 0 remaining events (all deleted), got %d", remainingCount)
+	}
+}
+
+func TestIntegration_OutboxSequenceOrdering(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	}))
+
+	db, cleanupDB := setupPostgres(t)
+	defer cleanupDB()
+
+	rabbitConn, cleanupRabbit := setupRabbitMQ(t)
+	defer cleanupRabbit()
+
+	source := newPostgresSource(db, logger)
+	destination, err := newRabbitmqDestination(rabbitConn, logger)
+	if err != nil {
+		t.Fatalf("failed to create rabbitmq destination: %v", err)
+	}
+	defer destination.Close()
+
+	ch, err := rabbitConn.Channel()
+	if err != nil {
+		t.Fatalf("failed to open channel: %v", err)
+	}
+	defer ch.Close()
+
+	queue, err := ch.QueueDeclare("", false, false, false, false, nil)
+	if err != nil {
+		t.Fatalf("failed to declare queue: %v", err)
+	}
+
+	err = ch.QueueBind(queue.Name, "entity.*", "outbox", false, nil)
+	if err != nil {
+		t.Fatalf("failed to bind queue: %v", err)
+	}
+
+	outbox := New[*outboxEvent](source, destination, Config{
+		BatchSize:           10,
+		SleepSec:            1,
+		MaxConcurrentGroups: 2,
+	}, logger)
+
+	now := time.Now()
+	events := []struct {
+		id       string
+		entityId string
+		message  string
+		sequence int64
+	}{
+		{"event1", "user1", `{"type": "created", "seq": 3}`, now.Add(3 * time.Second).UnixMilli()},
+		{"event2", "user1", `{"type": "created", "seq": 1}`, now.Add(1 * time.Second).UnixMilli()},
+		{"event3", "user1", `{"type": "created", "seq": 2}`, now.Add(2 * time.Second).UnixMilli()},
+		{"event4", "user2", `{"type": "created", "seq": 20}`, now.Add(20 * time.Second).UnixMilli()},
+		{"event5", "user2", `{"type": "created", "seq": 10}`, now.Add(10 * time.Second).UnixMilli()},
+	}
+
+	query := "INSERT INTO outbox_events (id, entity_id, message, created_at) VALUES "
+	values := make([]interface{}, 0, len(events)*4)
+	placeholders := make([]string, 0, len(events))
+
+	for i, event := range events {
+		createdAt := time.UnixMilli(event.sequence)
+		placeholders = append(placeholders, fmt.Sprintf("($%d, $%d, $%d, $%d)", i*4+1, i*4+2, i*4+3, i*4+4))
+		values = append(values, event.id, event.entityId, event.message, createdAt)
+	}
+
+	query += strings.Join(placeholders, ", ")
+	_, err = db.Exec(query, values...)
+	if err != nil {
+		t.Fatalf("failed to insert test events: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- outbox.Run(ctx)
+	}()
+
+	time.Sleep(3 * time.Second)
+	cancel()
+
+	<-errChan
+
+	var remainingCount int
+	err = db.QueryRow("SELECT COUNT(*) FROM outbox_events").Scan(&remainingCount)
+	if err != nil {
+		t.Fatalf("failed to query remaining events count: %v", err)
+	}
+
+	if remainingCount != 0 {
+		t.Errorf("expected 0 remaining events (all deleted), got %d", remainingCount)
+	}
+
+	type message struct {
+		body     string
+		entityId string
+	}
+	messages := make([]message, 0)
+	for {
+		msg, ok, err := ch.Get(queue.Name, true)
+		if err != nil || !ok {
+			break
+		}
+		routingKey := msg.RoutingKey
+		entityId := ""
+		if len(routingKey) > 7 {
+			entityId = routingKey[7:]
+		}
+		messages = append(messages, message{body: string(msg.Body), entityId: entityId})
+	}
+
+	if len(messages) != 5 {
+		t.Errorf("expected 5 messages, got %d", len(messages))
+	}
+
+	user1Messages := make([]string, 0)
+	user2Messages := make([]string, 0)
+	for _, msg := range messages {
+		if msg.entityId == "user1" {
+			user1Messages = append(user1Messages, msg.body)
+		} else if msg.entityId == "user2" {
+			user2Messages = append(user2Messages, msg.body)
+		}
+	}
+
+	if len(user1Messages) != 3 {
+		t.Errorf("expected 3 user1 messages, got %d", len(user1Messages))
+	}
+	if len(user2Messages) != 2 {
+		t.Errorf("expected 2 user2 messages, got %d", len(user2Messages))
+	}
+
+	if len(user1Messages) == 3 {
+		if user1Messages[0] != `{"type": "created", "seq": 1}` {
+			t.Errorf("user1 first message incorrect: %s", user1Messages[0])
+		}
+		if user1Messages[1] != `{"type": "created", "seq": 2}` {
+			t.Errorf("user1 second message incorrect: %s", user1Messages[1])
+		}
+		if user1Messages[2] != `{"type": "created", "seq": 3}` {
+			t.Errorf("user1 third message incorrect: %s", user1Messages[2])
+		}
+	}
+
+	if len(user2Messages) == 2 {
+		if user2Messages[0] != `{"type": "created", "seq": 10}` {
+			t.Errorf("user2 first message incorrect: %s", user2Messages[0])
+		}
+		if user2Messages[1] != `{"type": "created", "seq": 20}` {
+			t.Errorf("user2 second message incorrect: %s", user2Messages[1])
+		}
 	}
 }

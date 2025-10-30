@@ -1,35 +1,40 @@
-# Outbox Pattern Implementation Summary
+# Architecture
 
-## Delete vs Soft Delete Approach
+## Core Design
 
-This implementation uses the **delete approach** for the outbox pattern, which is the most common and recommended approach for production systems.
+The `Outbox` is interface-based and doesn't prescribe any specific database or message broker. Implement `Source` and `Destination` however you need.
 
-## Why Delete Instead of Soft Delete?
+This document shows how the integration tests implement `Source`, but these are just examples.
 
-### Delete Approach (Current Implementation)
+## Event Acknowledgment Strategies
+
+### Delete After Send
+
+Integration tests use this approach - events are deleted once delivered.
+
 ```go
-func (p *postgresSource) MarkAsSent(ctx context.Context, item Item) error {
+func (p *postgresSource) Acknowledge(ctx context.Context, item *outboxEvent) error {
     query := `DELETE FROM outbox_events WHERE id = $1`
     _, err := p.db.ExecContext(ctx, query, item.GetId())
     return err
 }
 ```
 
-**Advantages:**
-- ✅ Optimal performance - table stays small
-- ✅ Minimal indexing required (just primary key + created_at)
-- ✅ No cleanup jobs needed
-- ✅ Simple to implement and maintain
-- ✅ No risk of unbounded table growth
+Pros:
+- Simple
+- Fast queries (table stays small)
+- No maintenance needed
 
-**Trade-offs:**
-- ❌ No audit trail of sent events
-- ❌ Cannot replay historical events
-- ❌ Cannot debug past deliveries
+Cons:
+- No audit trail
+- Can't replay events
 
-### Soft Delete Approach (Alternative)
+### Soft Delete
+
+Mark events as sent instead of deleting them.
+
 ```go
-func (p *postgresSource) MarkAsSent(ctx context.Context, item Item) error {
+func (p *postgresSource) Acknowledge(ctx context.Context, item *outboxEvent) error {
     query := `UPDATE outbox_events SET sent_at = NOW() WHERE id = $1`
     _, err := p.db.ExecContext(ctx, query, item.GetId())
     return err
@@ -38,120 +43,54 @@ func (p *postgresSource) MarkAsSent(ctx context.Context, item Item) error {
 
 Requires:
 - `sent_at TIMESTAMP NULL` column
-- Partial indexes: `CREATE INDEX ... WHERE sent_at IS NULL`
-- Cleanup job to delete old events
-- More complex queries
+- Partial index: `CREATE INDEX idx_outbox_events_unsent ON outbox_events(created_at) WHERE sent_at IS NULL`
+- Cleanup job to purge old events
 
-## Database Schema
+## Schema Example
 
-### Current (Delete Approach)
 ```sql
 CREATE TABLE outbox_events (
     id VARCHAR(255) PRIMARY KEY,
     entity_id VARCHAR(255) NOT NULL,
+    sequence BIGINT NOT NULL,
     message TEXT NOT NULL,
     created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_outbox_events_created_at ON outbox_events(created_at);
+CREATE INDEX idx_outbox_events_sequence ON outbox_events(sequence);
 ```
 
-### Query
-```sql
-SELECT id, entity_id, message, created_at 
-FROM outbox_events 
-ORDER BY created_at ASC 
-LIMIT $1
-```
+## Event Ordering
 
-## When to Use Each Approach
+**Don't use `created_at` for ordering in production.** Multiple events created in the same transaction will have identical (or nearly identical) timestamps. Clock skew between servers makes this worse.
 
-### Use Delete (Current) When:
-- You don't need audit trail
-- Performance is critical
-- Simplicity is valued
-- Event replay not required
-- No compliance requirements for event retention
+Use an explicit sequence number instead:
 
-### Use Soft Delete When:
-- Audit trail required (e.g., compliance, regulations)
-- Need to debug delivery issues
-- Want to replay events
-- Need analytics on sent events
-- Can tolerate cleanup job complexity
-
-### Use Archive Approach When:
-- Need full history but also fast queries
-- Analytics on historical data needed
-- Compliance requires long-term retention
-- Have resources for more complex setup
-
-## Migration Path
-
-If you later need audit capabilities, you can easily migrate:
-
-1. **Add sent_at column:**
-```sql
-ALTER TABLE outbox_events ADD COLUMN sent_at TIMESTAMP NULL;
-```
-
-2. **Update MarkAsSent to soft delete:**
 ```go
-func (p *postgresSource) MarkAsSent(ctx context.Context, item Item) error {
-    query := `UPDATE outbox_events SET sent_at = NOW() WHERE id = $1`
-    _, err := p.db.ExecContext(ctx, query, item.GetId())
-    return err
+func CreateOrder(ctx context.Context, tx *sql.Tx, order Order) error {
+    seq := 1
+    
+    if err := saveOrder(tx, order); err != nil {
+        return err
+    }
+    
+    events := []OutboxEvent{
+        {EntityID: order.ID, Sequence: seq++, Type: "OrderCreated"},
+        {EntityID: order.ID, Sequence: seq++, Type: "OrderItemAdded"},
+        {EntityID: order.ID, Sequence: seq++, Type: "OrderConfirmed"},
+    }
+    return saveOutboxEvents(tx, events)
 }
 ```
 
-3. **Add partial indexes:**
-```sql
-CREATE INDEX idx_outbox_events_unsent ON outbox_events(created_at) WHERE sent_at IS NULL;
-```
+The `GetSequence()` method on the `Item` interface exists for this reason.
 
-4. **Update GetItems query:**
-```sql
-SELECT id, entity_id, message, created_at 
-FROM outbox_events 
-WHERE sent_at IS NULL
-ORDER BY created_at ASC 
-LIMIT $1
-```
+## Migration to Soft Delete
 
-5. **Add cleanup job:**
-```go
-func CleanupOldEvents(ctx context.Context, db *sql.DB, retentionDays int) error {
-    query := `DELETE FROM outbox_events WHERE sent_at < NOW() - INTERVAL '? days'`
-    _, err := db.ExecContext(ctx, query, retentionDays)
-    return err
-}
-```
+If you start with delete-after-send and later need audit capabilities:
 
-## Recommendations
-
-**For most use cases:** Use the current delete approach. It's battle-tested, performant, and simple.
-
-**For compliance-heavy systems:** Use soft delete with 7-30 day retention and a daily cleanup job.
-
-**For enterprise analytics:** Use archive table approach to separate hot (unsent) from cold (historical) data.
-
-## Performance Characteristics
-
-### Delete Approach
-- **Write performance:** Excellent (simple DELETE)
-- **Read performance:** Excellent (small table, simple index)
-- **Storage:** Minimal (only unsent events)
-- **Maintenance:** None required
-
-### Soft Delete with Cleanup
-- **Write performance:** Good (UPDATE + periodic DELETE)
-- **Read performance:** Good (with partial indexes)
-- **Storage:** Moderate (retention period * event rate)
-- **Maintenance:** Daily cleanup job
-
-### Archive Approach
-- **Write performance:** Good (INSERT into archive)
-- **Read performance:** Excellent for hot table, slower for archive
-- **Storage:** High (full history)
-- **Maintenance:** Archive job + separate table management
-
+1. Add `sent_at` column
+2. Update `Acknowledge` to set `sent_at` instead of deleting
+3. Create partial index: `CREATE INDEX ... WHERE sent_at IS NULL`
+4. Add cleanup job to purge old events
+5. Update queries to filter `WHERE sent_at IS NULL`

@@ -5,28 +5,44 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"slices"
 	"syscall"
 
 	"github.com/aliaksandr-biarozka/go-outbox"
 )
 
-type exampleSource struct{}
-
-func (s *exampleSource) GetItems(ctx context.Context, batchSize int) ([]outbox.Item, error) {
-	return nil, nil
+type exampleItem struct {
+	entityId string
+	id       string
+	sequence int64
 }
 
-func (s *exampleSource) MarkAsSent(ctx context.Context, item outbox.Item) error {
+func (e exampleItem) GetEntityId() string { return e.entityId }
+func (e exampleItem) GetId() string       { return e.id }
+func (e exampleItem) GetSequence() int64  { return e.sequence }
+
+type exampleSource struct {
+	items []exampleItem
+}
+
+func (s *exampleSource) GetItems(ctx context.Context, batchSize int) ([]exampleItem, error) {
+	return s.items, nil
+}
+
+func (s *exampleSource) Acknowledge(ctx context.Context, item exampleItem) error {
+	s.items = slices.DeleteFunc(s.items, func(i exampleItem) bool {
+		return i.id == item.id
+	})
 	return nil
 }
 
 type exampleDestination struct{}
 
-func (d *exampleDestination) Send(ctx context.Context, item outbox.Item) error {
+func (d *exampleDestination) Send(ctx context.Context, item exampleItem) error {
 	return nil
 }
 
-func (d *exampleDestination) SendMany(ctx context.Context, items []outbox.Item) error {
+func (d *exampleDestination) SendMany(ctx context.Context, items []exampleItem) error {
 	for _, item := range items {
 		if err := d.Send(ctx, item); err != nil {
 			return err
@@ -49,13 +65,21 @@ func main() {
 		}
 	}()
 
-	source := &exampleSource{}
+	source := &exampleSource{
+		items: []exampleItem{
+			{entityId: "entity1", id: "1", sequence: 1},
+			{entityId: "entity1", id: "2", sequence: 2},
+			{entityId: "entity1", id: "3", sequence: 3},
+			{entityId: "entity2", id: "4", sequence: 4},
+			{entityId: "entity2", id: "5", sequence: 5},
+			{entityId: "entity2", id: "6", sequence: 6},
+		},
+	}
 	destination := &exampleDestination{}
 
-	ob := outbox.New(source, destination, outbox.Config{
+	ob := outbox.New[exampleItem](source, destination, outbox.Config{
 		BatchSize:           30,
-		MaxTries:            3,
-		MaxSleepSec:         5,
+		SleepSec:            5,
 		MaxConcurrentGroups: 30,
 	}, logger)
 

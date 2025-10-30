@@ -7,12 +7,12 @@ A robust, production-ready implementation of the transactional outbox pattern in
 The outbox pattern ensures reliable message delivery by persisting events in the same database transaction as your business data, then reliably delivering them to a message broker.
 
 This implementation provides:
-- ✅ **Reliable delivery** with at-least-once semantics
-- ✅ **Concurrent processing** with configurable concurrency limits
-- ✅ **Automatic retries** with exponential backoff
-- ✅ **Entity-based grouping** for ordered processing per entity
-- ✅ **Delete-after-send** strategy for optimal performance
-- ✅ **Comprehensive test coverage** (unit + integration)
+- **Reliable delivery** with at-least-once semantics
+- **Concurrent processing** with configurable concurrency limits
+- **Automatic retries** for transient failures
+- **Entity-based grouping** for ordered processing per entity
+- **Delete-after-send** strategy for optimal performance
+- **Comprehensive test coverage** (unit + integration)
 
 ## Installation
 
@@ -29,21 +29,32 @@ import (
     "context"
     "log/slog"
     
-    "aliaksandr-biarozka/go-outbox"
+    "github.com/aliaksandr-biarozka/go-outbox"
 )
+
+// Define your event type
+type MyEvent struct {
+    ID        string
+    EntityID  string
+    Sequence  int64
+    Payload   []byte
+}
+
+func (e *MyEvent) GetId() string        { return e.ID }
+func (e *MyEvent) GetEntityId() string  { return e.EntityID }
+func (e *MyEvent) GetSequence() int64   { return e.Sequence }
 
 func main() {
     logger := slog.Default()
     
-    // Implement Source and Destination interfaces
+    // Implement Source and Destination interfaces for your event type
     source := &MyDatabaseSource{}
     destination := &MyMessageQueueDestination{}
     
-    // Create outbox with configuration
-    ob := outbox.New(source, destination, outbox.Config{
+    // Create outbox with your event type
+    ob := outbox.New[*MyEvent](source, destination, outbox.Config{
         BatchSize:           30,  // Items to fetch per batch
-        MaxTries:            3,   // Retry attempts
-        MaxSleepSec:         5,   // Sleep when no items
+        SleepSec:            5,   // Sleep when no items
         MaxConcurrentGroups: 30,  // Concurrent entity groups
     }, logger)
     
@@ -62,24 +73,57 @@ func main() {
 type Item interface {
     GetEntityId() string  // Context-specific ID (userId, accountId, etc.)
     GetId() string        // Unique item ID (messageId, orderId, etc.)
+    GetSequence() int64   // Monotonically increasing value for ordering
 }
 ```
+
+The `GetSequence()` method determines the processing order within each entity group. Common implementations:
+- `return time.Now().UnixMilli()` - Use timestamp in milliseconds
+- `return event.CreatedAt.UnixMilli()` - Use database timestamp
+- `return event.Version` - Use custom version/sequence number
+- `return event.ID` - Use auto-increment database ID
 
 ### Source
 ```go
-type Source interface {
-    GetItems(ctx context.Context, batchSize int) ([]Item, error)
-    MarkAsSent(ctx context.Context, item Item) error
+type Source[T Item] interface {
+    GetItems(ctx context.Context, batchSize int) ([]T, error)
+    Acknowledge(ctx context.Context, item T) error
 }
 ```
 
+`Source` is generic and works with any type `T` that implements the `Item` interface.
+
 ### Destination
 ```go
-type Destination interface {
-    Send(ctx context.Context, item Item) error
-    SendMany(ctx context.Context, items []Item) error
+type Destination[T Item] interface {
+    Send(ctx context.Context, item T) error
 }
 ```
+
+`Destination` is generic and works with any type `T` that implements the `Item` interface.
+
+### Outbox
+```go
+type Outbox[T Item] struct { ... }
+
+func New[T Item](
+    source Source[T],
+    destination Destination[T],
+    config Config,
+    logger *slog.Logger,
+) *Outbox[T]
+```
+
+The `Outbox` is generic and type-safe. When creating an outbox, specify your event type:
+```go
+// For pointer types
+outbox.New[*MyEvent](source, destination, config, logger)
+
+// For value types
+outbox.New[MyEvent](source, destination, config, logger)
+```
+
+All interfaces (`Source`, `Destination`) must use the same type `T`. This ensures compile-time type safety and eliminates runtime type assertions.
 
 ## How It Works
 
@@ -92,16 +136,17 @@ type Destination interface {
 ### Entity-Based Processing
 
 Items are grouped by `EntityId` and processed concurrently:
-- Items for the same entity are processed **sequentially** (maintains order)
+- Items for the same entity are processed **sequentially** in order of `GetSequence()` (maintains order)
 - Items for different entities are processed **in parallel** (up to `MaxConcurrentGroups`)
+
+**Ordering Guarantee**: Within each entity group, items are sorted by `GetSequence()` before processing. This ensures that events are delivered in the exact order they were created, even if they're fetched in batches.
 
 ## Configuration
 
 ```go
 type Config struct {
     BatchSize           int  // Number of items to fetch per batch (default: 30)
-    MaxTries            int  // Maximum retry attempts (default: 3)
-    MaxSleepSec         int  // Sleep duration when no items (default: 5)
+    SleepSec            int  // Sleep duration when no items (default: 5)
     MaxConcurrentGroups int  // Max concurrent entity groups (default: 30)
 }
 ```
@@ -138,10 +183,10 @@ See [TESTING.md](TESTING.md) for detailed testing documentation.
 This implementation uses the **delete approach** - events are deleted immediately after successful delivery.
 
 **Why delete?**
-- ✅ Small table size = optimal query performance
-- ✅ No cleanup jobs needed
-- ✅ Minimal indexing required
-- ✅ Simple implementation
+- Small table size = optimal query performance
+- No cleanup jobs needed
+- Minimal indexing required
+- Simple implementation
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed design decisions and alternative approaches.
 

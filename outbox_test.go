@@ -14,27 +14,29 @@ import (
 type mockItem struct {
 	entityId string
 	id       string
+	sequence int64
 }
 
 func (m mockItem) GetEntityId() string { return m.entityId }
 func (m mockItem) GetId() string       { return m.id }
+func (m mockItem) GetSequence() int64  { return m.sequence }
 
 type mockSource struct {
-	items           []Item
-	markAsSentCalls []Item
-	mu              sync.RWMutex
-	shouldError     bool
-	errorMsg        string
+	items            []mockItem
+	acknowledgeCalls []mockItem
+	mu               sync.RWMutex
+	shouldError      bool
+	errorMsg         string
 }
 
 func newMockSource() *mockSource {
 	return &mockSource{
-		items:           make([]Item, 0),
-		markAsSentCalls: make([]Item, 0),
+		items:            make([]mockItem, 0),
+		acknowledgeCalls: make([]mockItem, 0),
 	}
 }
 
-func (m *mockSource) GetItems(ctx context.Context, batchSize int) ([]Item, error) {
+func (m *mockSource) GetItems(ctx context.Context, batchSize int) ([]mockItem, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -43,21 +45,21 @@ func (m *mockSource) GetItems(ctx context.Context, batchSize int) ([]Item, error
 	}
 
 	if len(m.items) == 0 {
-		return []Item{}, nil
+		return []mockItem{}, nil
 	}
 
-	var result []Item
+	var result []mockItem
 	if len(m.items) > batchSize {
 		result = m.items[:batchSize]
 		m.items = m.items[batchSize:]
 	} else {
 		result = m.items
-		m.items = []Item{}
+		m.items = []mockItem{}
 	}
 	return result, nil
 }
 
-func (m *mockSource) MarkAsSent(ctx context.Context, item Item) error {
+func (m *mockSource) Acknowledge(ctx context.Context, item mockItem) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -65,11 +67,11 @@ func (m *mockSource) MarkAsSent(ctx context.Context, item Item) error {
 		return errors.New(m.errorMsg)
 	}
 
-	m.markAsSentCalls = append(m.markAsSentCalls, item)
+	m.acknowledgeCalls = append(m.acknowledgeCalls, item)
 	return nil
 }
 
-func (m *mockSource) setItems(items []Item) {
+func (m *mockSource) setItems(items []mockItem) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.items = items
@@ -82,15 +84,15 @@ func (m *mockSource) setError(shouldError bool, errorMsg string) {
 	m.errorMsg = errorMsg
 }
 
-func (m *mockSource) getMarkAsSentCalls() []Item {
+func (m *mockSource) getAcknowledgeCalls() []mockItem {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return append([]Item(nil), m.markAsSentCalls...)
+	return append([]mockItem(nil), m.acknowledgeCalls...)
 }
 
 type mockDestination struct {
-	sendCalls     []Item
-	sendManyCalls [][]Item
+	sendCalls     []mockItem
+	sendManyCalls [][]mockItem
 	mu            sync.RWMutex
 	shouldError   bool
 	errorMsg      string
@@ -98,12 +100,12 @@ type mockDestination struct {
 
 func newMockDestination() *mockDestination {
 	return &mockDestination{
-		sendCalls:     make([]Item, 0),
-		sendManyCalls: make([][]Item, 0),
+		sendCalls:     make([]mockItem, 0),
+		sendManyCalls: make([][]mockItem, 0),
 	}
 }
 
-func (m *mockDestination) Send(ctx context.Context, item Item) error {
+func (m *mockDestination) Send(ctx context.Context, item mockItem) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -116,7 +118,7 @@ func (m *mockDestination) Send(ctx context.Context, item Item) error {
 	return nil
 }
 
-func (m *mockDestination) SendMany(ctx context.Context, items []Item) error {
+func (m *mockDestination) SendMany(ctx context.Context, items []mockItem) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -135,16 +137,16 @@ func (m *mockDestination) setError(shouldError bool, errorMsg string) {
 	m.errorMsg = errorMsg
 }
 
-func (m *mockDestination) getSendCalls() []Item {
+func (m *mockDestination) getSendCalls() []mockItem {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return append([]Item(nil), m.sendCalls...)
+	return append([]mockItem(nil), m.sendCalls...)
 }
 
-func (m *mockDestination) getSendManyCalls() [][]Item {
+func (m *mockDestination) getSendManyCalls() [][]mockItem {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return append([][]Item(nil), m.sendManyCalls...)
+	return append([][]mockItem(nil), m.sendManyCalls...)
 }
 
 func TestNew(t *testing.T) {
@@ -162,8 +164,7 @@ func TestNew(t *testing.T) {
 			config: Config{},
 			expected: Config{
 				BatchSize:           30,
-				MaxTries:            3,
-				MaxSleepSec:         5,
+				SleepSec:            5,
 				MaxConcurrentGroups: 30,
 			},
 		},
@@ -171,14 +172,12 @@ func TestNew(t *testing.T) {
 			name: "custom values",
 			config: Config{
 				BatchSize:           10,
-				MaxTries:            5,
-				MaxSleepSec:         10,
+				SleepSec:            10,
 				MaxConcurrentGroups: 5,
 			},
 			expected: Config{
 				BatchSize:           10,
-				MaxTries:            5,
-				MaxSleepSec:         10,
+				SleepSec:            10,
 				MaxConcurrentGroups: 5,
 			},
 		},
@@ -186,14 +185,12 @@ func TestNew(t *testing.T) {
 			name: "negative values should be set to defaults",
 			config: Config{
 				BatchSize:           -1,
-				MaxTries:            -1,
-				MaxSleepSec:         -1,
+				SleepSec:            -1,
 				MaxConcurrentGroups: -1,
 			},
 			expected: Config{
 				BatchSize:           30,
-				MaxTries:            3,
-				MaxSleepSec:         5,
+				SleepSec:            5,
 				MaxConcurrentGroups: 30,
 			},
 		},
@@ -233,8 +230,7 @@ func TestOutbox_Run_NoItems(t *testing.T) {
 
 	outbox := New(source, destination, Config{
 		BatchSize:           10,
-		MaxTries:            3,
-		MaxSleepSec:         1, // Short sleep for testing
+		SleepSec:            1, // Short sleep for testing
 		MaxConcurrentGroups: 5,
 	}, logger)
 
@@ -259,17 +255,16 @@ func TestOutbox_Run_WithItems(t *testing.T) {
 	source := newMockSource()
 	destination := newMockDestination()
 
-	items := []Item{
-		mockItem{entityId: "user1", id: "item1"},
-		mockItem{entityId: "user1", id: "item2"},
-		mockItem{entityId: "user2", id: "item3"},
+	items := []mockItem{
+		{entityId: "user1", id: "item1"},
+		{entityId: "user1", id: "item2"},
+		{entityId: "user2", id: "item3"},
 	}
 	source.setItems(items)
 
 	outbox := New(source, destination, Config{
 		BatchSize:           10,
-		MaxTries:            3,
-		MaxSleepSec:         1,
+		SleepSec:            1,
 		MaxConcurrentGroups: 5,
 	}, logger)
 
@@ -291,9 +286,9 @@ func TestOutbox_Run_WithItems(t *testing.T) {
 		t.Errorf("expected %d send calls, got %d", len(items), len(sendCalls))
 	}
 
-	markAsSentCalls := source.getMarkAsSentCalls()
-	if len(markAsSentCalls) != len(items) {
-		t.Errorf("expected %d mark as sent calls, got %d", len(items), len(markAsSentCalls))
+	acknowledgeCalls := source.getAcknowledgeCalls()
+	if len(acknowledgeCalls) != len(items) {
+		t.Errorf("expected %d acknowledge calls, got %d", len(items), len(acknowledgeCalls))
 	}
 }
 
@@ -304,8 +299,7 @@ func TestOutbox_Run_ContextCancellation(t *testing.T) {
 
 	outbox := New(source, destination, Config{
 		BatchSize:           10,
-		MaxTries:            3,
-		MaxSleepSec:         1,
+		SleepSec:            1,
 		MaxConcurrentGroups: 5,
 	}, logger)
 
@@ -334,8 +328,7 @@ func TestOutbox_Run_SourceError(t *testing.T) {
 
 	outbox := New(source, destination, Config{
 		BatchSize:           10,
-		MaxTries:            3,
-		MaxSleepSec:         1,
+		SleepSec:            1,
 		MaxConcurrentGroups: 5,
 	}, logger)
 
@@ -364,8 +357,8 @@ func TestOutbox_Run_DestinationError(t *testing.T) {
 	source := newMockSource()
 	destination := newMockDestination()
 
-	items := []Item{
-		mockItem{entityId: "user1", id: "item1"},
+	items := []mockItem{
+		{entityId: "user1", id: "item1"},
 	}
 	source.setItems(items)
 
@@ -373,8 +366,7 @@ func TestOutbox_Run_DestinationError(t *testing.T) {
 
 	outbox := New(source, destination, Config{
 		BatchSize:           10,
-		MaxTries:            1, // Only 1 try to speed up test
-		MaxSleepSec:         1,
+		SleepSec:            1,
 		MaxConcurrentGroups: 5,
 	}, logger)
 
@@ -396,9 +388,9 @@ func TestOutbox_Run_DestinationError(t *testing.T) {
 		t.Error("expected some send calls, got 0")
 	}
 
-	markAsSentCalls := source.getMarkAsSentCalls()
-	if len(markAsSentCalls) != 0 {
-		t.Errorf("expected 0 mark as sent calls, got %d", len(markAsSentCalls))
+	acknowledgeCalls := source.getAcknowledgeCalls()
+	if len(acknowledgeCalls) != 0 {
+		t.Errorf("expected 0 acknowledge calls, got %d", len(acknowledgeCalls))
 	}
 }
 
@@ -407,19 +399,18 @@ func TestOutbox_Run_Grouping(t *testing.T) {
 	source := newMockSource()
 	destination := newMockDestination()
 
-	items := []Item{
-		mockItem{entityId: "user1", id: "item1"},
-		mockItem{entityId: "user1", id: "item2"},
-		mockItem{entityId: "user2", id: "item3"},
-		mockItem{entityId: "user2", id: "item4"},
-		mockItem{entityId: "user3", id: "item5"},
+	items := []mockItem{
+		{entityId: "user1", id: "item1"},
+		{entityId: "user1", id: "item2"},
+		{entityId: "user2", id: "item3"},
+		{entityId: "user2", id: "item4"},
+		{entityId: "user3", id: "item5"},
 	}
 	source.setItems(items)
 
 	outbox := New(source, destination, Config{
 		BatchSize:           10,
-		MaxTries:            3,
-		MaxSleepSec:         1,
+		SleepSec:            1,
 		MaxConcurrentGroups: 5,
 	}, logger)
 
@@ -441,9 +432,9 @@ func TestOutbox_Run_Grouping(t *testing.T) {
 		t.Errorf("expected %d send calls, got %d", len(items), len(sendCalls))
 	}
 
-	markAsSentCalls := source.getMarkAsSentCalls()
-	if len(markAsSentCalls) != len(items) {
-		t.Errorf("expected %d mark as sent calls, got %d", len(items), len(markAsSentCalls))
+	acknowledgeCalls := source.getAcknowledgeCalls()
+	if len(acknowledgeCalls) != len(items) {
+		t.Errorf("expected %d acknowledge calls, got %d", len(items), len(acknowledgeCalls))
 	}
 }
 
@@ -452,7 +443,7 @@ func TestOutbox_Run_BatchSize(t *testing.T) {
 	source := newMockSource()
 	destination := newMockDestination()
 
-	items := make([]Item, 0, 15)
+	items := make([]mockItem, 0, 15)
 	for i := 0; i < 15; i++ {
 		items = append(items, mockItem{entityId: "user1", id: fmt.Sprintf("item%d", i)})
 	}
@@ -460,8 +451,7 @@ func TestOutbox_Run_BatchSize(t *testing.T) {
 
 	outbox := New(source, destination, Config{
 		BatchSize:           5, // Small batch size
-		MaxTries:            3,
-		MaxSleepSec:         1,
+		SleepSec:            1,
 		MaxConcurrentGroups: 5,
 	}, logger)
 
@@ -481,5 +471,82 @@ func TestOutbox_Run_BatchSize(t *testing.T) {
 	sendCalls := destination.getSendCalls()
 	if len(sendCalls) != len(items) {
 		t.Errorf("expected %d send calls, got %d", len(items), len(sendCalls))
+	}
+}
+
+func TestOutbox_Run_SequenceOrdering(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	source := newMockSource()
+	destination := newMockDestination()
+
+	items := []mockItem{
+		{entityId: "user1", id: "item1", sequence: 300},
+		{entityId: "user1", id: "item2", sequence: 100},
+		{entityId: "user1", id: "item3", sequence: 200},
+		{entityId: "user2", id: "item4", sequence: 50},
+		{entityId: "user2", id: "item5", sequence: 10},
+	}
+	source.setItems(items)
+
+	outbox := New(source, destination, Config{
+		BatchSize:           10,
+		SleepSec:            1,
+		MaxConcurrentGroups: 5,
+	}, logger)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- outbox.Run(ctx)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+
+	<-errChan
+
+	sendCalls := destination.getSendCalls()
+	if len(sendCalls) != len(items) {
+		t.Errorf("expected %d send calls, got %d", len(items), len(sendCalls))
+	}
+
+	var user1Items []mockItem
+	var user2Items []mockItem
+	for _, item := range sendCalls {
+		if item.entityId == "user1" {
+			user1Items = append(user1Items, item)
+		} else if item.entityId == "user2" {
+			user2Items = append(user2Items, item)
+		}
+	}
+
+	if len(user1Items) != 3 {
+		t.Errorf("expected 3 user1 items, got %d", len(user1Items))
+	}
+	if len(user2Items) != 2 {
+		t.Errorf("expected 2 user2 items, got %d", len(user2Items))
+	}
+
+	if len(user1Items) == 3 {
+		if user1Items[0].sequence != 100 {
+			t.Errorf("user1 first item: expected sequence 100, got %d", user1Items[0].sequence)
+		}
+		if user1Items[1].sequence != 200 {
+			t.Errorf("user1 second item: expected sequence 200, got %d", user1Items[1].sequence)
+		}
+		if user1Items[2].sequence != 300 {
+			t.Errorf("user1 third item: expected sequence 300, got %d", user1Items[2].sequence)
+		}
+	}
+
+	if len(user2Items) == 2 {
+		if user2Items[0].sequence != 10 {
+			t.Errorf("user2 first item: expected sequence 10, got %d", user2Items[0].sequence)
+		}
+		if user2Items[1].sequence != 50 {
+			t.Errorf("user2 second item: expected sequence 50, got %d", user2Items[1].sequence)
+		}
 	}
 }
