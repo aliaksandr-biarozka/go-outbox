@@ -1,0 +1,16 @@
+{
+    "go.testEnvVars": {
+        "DOCKER_HOST": "unix:///Users/aliaksandrbiarozka/.colima/default/docker.sock",
+        "TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE": "/var/run/docker.sock"
+    },
+    "go.testTimeout": "120s",
+    "go.buildFlags": ["-tags="],
+    "go.lintOnSave": "workspace",
+    "files.exclude": {
+        "**/examples": false
+    },
+    "go.toolsEnvVars": {
+        "GOFLAGS": "-tags="
+    }
+}
+
