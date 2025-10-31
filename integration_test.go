@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -627,5 +629,125 @@ func TestIntegration_OutboxSequenceOrdering(t *testing.T) {
 		if user2Messages[1] != `{"type": "created", "seq": 20}` {
 			t.Errorf("user2 second message incorrect: %s", user2Messages[1])
 		}
+	}
+}
+
+type testMetrics struct {
+	itemsProcessed atomic.Int64
+	batchDurations []time.Duration
+	batchSuccesses []bool
+	mu             sync.Mutex
+}
+
+func (m *testMetrics) IncProcessedItems() {
+	m.itemsProcessed.Add(1)
+}
+
+func (m *testMetrics) RecordBatchDuration(duration time.Duration, success bool) {
+	m.batchDurations = append(m.batchDurations, duration)
+	m.batchSuccesses = append(m.batchSuccesses, success)
+}
+
+func TestIntegration_Metrics(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+
+	ctx := context.Background()
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	db, cleanupDB := setupPostgres(t)
+	defer cleanupDB()
+
+	rabbitmqConn, cleanupRabbit := setupRabbitMQ(t)
+	defer cleanupRabbit()
+
+	ch, err := rabbitmqConn.Channel()
+	if err != nil {
+		t.Fatalf("failed to open channel: %v", err)
+	}
+	defer ch.Close()
+
+	exchangeName := "test_metrics_exchange"
+	err = ch.ExchangeDeclare(exchangeName, "topic", true, false, false, false, nil)
+	if err != nil {
+		t.Fatalf("failed to declare exchange: %v", err)
+	}
+
+	queueName := "test_metrics_queue"
+	queue, err := ch.QueueDeclare(queueName, false, false, false, false, nil)
+	if err != nil {
+		t.Fatalf("failed to declare queue: %v", err)
+	}
+
+	err = ch.QueueBind(queue.Name, "user.#", exchangeName, false, nil)
+	if err != nil {
+		t.Fatalf("failed to bind queue: %v", err)
+	}
+
+	source := newPostgresSource(db, logger)
+	destination, err := newRabbitmqDestination(rabbitmqConn, logger)
+	if err != nil {
+		t.Fatalf("failed to create destination: %v", err)
+	}
+	metrics := &testMetrics{}
+
+	events := []struct {
+		id       string
+		entityId string
+		message  string
+	}{
+		{id: "1", entityId: "user1", message: `{"event": "created"}`},
+		{id: "2", entityId: "user2", message: `{"event": "updated"}`},
+		{id: "3", entityId: "user1", message: `{"event": "deleted"}`},
+	}
+	bulkInsertEvents(t, db, events)
+
+	ob := New[*outboxEvent](source, destination, Config{
+		BatchSize:           10,
+		SleepSec:            1,
+		MaxConcurrentGroups: 5,
+		Metrics:             metrics,
+	}, logger)
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	go func() {
+		if err := ob.Run(ctx); err != nil && err != context.Canceled {
+			t.Errorf("outbox failed: %v", err)
+		}
+	}()
+
+	time.Sleep(2 * time.Second)
+	cancel()
+	time.Sleep(500 * time.Millisecond)
+
+	processedCount := metrics.itemsProcessed.Load()
+	if processedCount != 3 {
+		t.Errorf("expected 3 items processed, got %d", processedCount)
+	}
+
+	batchCount := len(metrics.batchDurations)
+	batchSuccesses := metrics.batchSuccesses
+
+	if batchCount == 0 {
+		t.Error("expected at least one batch duration recorded")
+	}
+
+	for i, duration := range metrics.batchDurations {
+		if duration <= 0 {
+			t.Errorf("batch %d has invalid duration: %v", i, duration)
+		}
+	}
+
+	successCount := 0
+	for _, success := range batchSuccesses {
+		if success {
+			successCount++
+		}
+	}
+	if successCount == 0 {
+		t.Error("expected at least one successful batch")
 	}
 }

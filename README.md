@@ -144,11 +144,59 @@ Items are grouped by `EntityId` and processed concurrently:
 
 ```go
 type Config struct {
-    BatchSize           int  // Number of items to fetch per batch (default: 30)
-    SleepSec            int  // Sleep duration when no items (default: 5)
-    MaxConcurrentGroups int  // Max concurrent entity groups (default: 30)
+    BatchSize           int      // Number of items to fetch per batch (default: 30)
+    SleepSec            int      // Sleep duration when no items (default: 5)
+    MaxConcurrentGroups int      // Max concurrent entity groups (default: 30)
+    Metrics             Metrics  // Optional metrics collector (default: nil)
 }
 ```
+
+## Observability
+
+### Metrics
+
+The outbox supports optional metrics collection through the `Metrics` interface:
+
+```go
+type Metrics interface {
+    IncProcessedItems()
+    RecordBatchDuration(duration time.Duration, success bool)
+}
+```
+
+Implement this interface with your preferred metrics backend (Prometheus, OpenTelemetry, StatsD, etc.):
+
+```go
+// Example: Prometheus implementation
+type prometheusMetrics struct {
+    itemsProcessed   prometheus.Counter
+    batchDuration    prometheus.Histogram
+    batchesSucceeded prometheus.Counter
+    batchesFailed    prometheus.Counter
+}
+
+func (m *prometheusMetrics) IncProcessedItems() {
+    m.itemsProcessed.Inc()
+}
+
+func (m *prometheusMetrics) RecordBatchDuration(duration time.Duration, success bool) {
+    m.batchDuration.Observe(duration.Seconds())
+    if success {
+        m.batchesSucceeded.Inc()
+    } else {
+        m.batchesFailed.Inc()
+    }
+}
+
+// Use it
+metrics := &prometheusMetrics{...}
+outbox.New(source, dest, outbox.Config{
+    BatchSize: 30,
+    Metrics:   metrics,
+}, logger)
+```
+
+The `IncProcessedItems()` is called once per successfully processed item (after both send and acknowledge). The `RecordBatchDuration()` is called once per batch with the processing time and success status.
 
 ## Examples
 

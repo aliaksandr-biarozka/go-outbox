@@ -4,7 +4,7 @@
 // The outbox pattern ensures at-least-once delivery semantics by:
 //   - Fetching unsent items from a persistent source (database)
 //   - Grouping items by entity ID for ordered processing
-//   - Sending items to a destination (message queue) with automatic retries
+//   - Sending items to a destination (message queue)
 //   - Marking items as sent after successful delivery
 //
 // Example usage:
@@ -96,6 +96,19 @@ type Destination[T Item] interface {
 	Send(ctx context.Context, item T) error
 }
 
+// Metrics provides observability into outbox processing operations.
+// Implement this interface to collect metrics using your preferred backend
+// (Prometheus, OpenTelemetry, StatsD, etc.).
+type Metrics interface {
+	// IncProcessedItems increments the counter of successfully processed items by 1.
+	// Called once per item after successful send and acknowledge.
+	IncProcessedItems()
+
+	// RecordBatchDuration records the time taken to process a batch of items.
+	// The success parameter indicates whether the batch was fully processed without errors.
+	RecordBatchDuration(duration time.Duration, success bool)
+}
+
 // Config holds configuration parameters for the outbox processor.
 // Zero values will be replaced with sensible defaults.
 type Config struct {
@@ -113,6 +126,10 @@ type Config struct {
 	// Should not exceed your database connection pool size.
 	// Default: 30
 	MaxConcurrentGroups int
+
+	// Metrics is an optional metrics collector for observability.
+	// If nil, no metrics are recorded.
+	Metrics Metrics
 }
 
 // Outbox is the main processor that coordinates fetching items from a source,
@@ -127,6 +144,7 @@ type Outbox[T Item] struct {
 	destination Destination[T]
 	config      Config
 	semaphore   chan struct{}
+	metrics     Metrics
 }
 
 // New creates a new Outbox processor with the given source, destination, configuration, and logger.
@@ -163,6 +181,7 @@ func New[T Item](source Source[T], destination Destination[T], config Config, lo
 		destination: destination,
 		config:      config,
 		semaphore:   make(chan struct{}, config.MaxConcurrentGroups),
+		metrics:     config.Metrics,
 	}
 }
 
@@ -230,9 +249,14 @@ func (o *Outbox[T]) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
+			batchStart := time.Now()
+
 			items, err := o.source.GetItems(ctx, o.config.BatchSize)
 			if err != nil {
 				o.logger.ErrorContext(ctx, "failed to get items", slog.Any("error", err))
+				if o.metrics != nil {
+					o.metrics.RecordBatchDuration(time.Since(batchStart), false)
+				}
 				if err := sleep(); err != nil {
 					return err
 				}
@@ -241,6 +265,9 @@ func (o *Outbox[T]) Run(ctx context.Context) error {
 
 			if len(items) == 0 {
 				o.logger.InfoContext(ctx, "no items to process. sleeping", slog.Int("sleep_sec", o.config.SleepSec))
+				if o.metrics != nil {
+					o.metrics.RecordBatchDuration(time.Since(batchStart), true)
+				}
 				if err := sleep(); err != nil {
 					return err
 				}
@@ -253,8 +280,8 @@ func (o *Outbox[T]) Run(ctx context.Context) error {
 			}
 
 			// Sort items within each group by sequence for ordered processing
-			for _, items := range groupedItems {
-				slices.SortFunc(items, func(a, b T) int {
+			for _, gi := range groupedItems {
+				slices.SortFunc(gi, func(a, b T) int {
 					seqA, seqB := a.GetSequence(), b.GetSequence()
 					if seqA < seqB {
 						return -1
@@ -299,10 +326,19 @@ func (o *Outbox[T]) Run(ctx context.Context) error {
 							return
 						}
 						l.DebugContext(ctx, "acknowledged item", slog.String("item_id", item.GetId()))
+
+						if o.metrics != nil {
+							o.metrics.IncProcessedItems()
+						}
 					}
 				}(items, groupLogger)
 			}
 			wg.Wait()
+
+			if o.metrics != nil {
+				success := !hadError.Load()
+				o.metrics.RecordBatchDuration(time.Since(batchStart), success)
+			}
 
 			if hadError.Load() {
 				logger.WarnContext(ctx, "batch processing failed, sleeping before retry", slog.Int("sleep_sec", o.config.SleepSec))
