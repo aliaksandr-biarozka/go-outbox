@@ -42,15 +42,6 @@ func (d *exampleDestination) Send(ctx context.Context, item exampleItem) error {
 	return nil
 }
 
-func (d *exampleDestination) SendMany(ctx context.Context, items []exampleItem) error {
-	for _, item := range items {
-		if err := d.Send(ctx, item); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		AddSource: true,
@@ -77,7 +68,7 @@ func main() {
 	}
 	destination := &exampleDestination{}
 
-	ob := outbox.New[exampleItem](source, destination, outbox.Config{
+	ob := outbox.New(source, destination, outbox.Config{
 		BatchSize:           30,
 		SleepSec:            5,
 		MaxConcurrentGroups: 30,

@@ -84,13 +84,8 @@ type Item interface {
 //
 // Implementation notes:
 //   - Send should be idempotent when possible (same item sent twice should not cause issues)
-//   - SendMany can be optimized for batch sending if the destination supports it
-//   - Both methods should handle context cancellation and return descriptive errors
+//   - Should handle context cancellation and return descriptive errors
 type Destination[T Item] interface {
-	// SendMany sends multiple items to the destination in a batch.
-	// Implementations can optimize this for bulk operations or simply call Send in a loop.
-	SendMany(ctx context.Context, items []T) error
-
 	// Send sends a single item to the destination.
 	// If this fails, the item will remain in the source and be retried on the next outbox iteration.
 	Send(ctx context.Context, item T) error
